@@ -58,9 +58,53 @@ function isJobExpired(job) {
   return false;
 }
 
-async function deleteExpiredJobs() {
+async function deleteExpiredJobs(options = {}) {
   const Job = require('../models/Job');
+  const Settings = require('../models/Settings');
+
+  const lockKey = 'job_cleanup_lock';
+  const now = new Date();
+  const LOCK_TIMEOUT_MS = 5 * 60 * 1000; // 5-minute safety lease
+  const lockId = `${process.pid}_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+
+  let lockAcquired = false;
+
   try {
+    // Ensure lock document exists without modifying existing lock state
+    await Settings.updateOne(
+      { key: lockKey },
+      { $setOnInsert: { key: lockKey, locked: false } },
+      { upsert: true }
+    );
+
+    // Acquire atomic distributed lock to prevent concurrent executions
+    const lock = await Settings.findOneAndUpdate(
+      {
+        key: lockKey,
+        $or: [
+          { locked: false },
+          { locked: { $exists: false } },
+          { lockedUntil: { $lt: now } },
+          { lockedUntil: { $exists: false } },
+        ],
+      },
+      {
+        $set: {
+          locked: true,
+          lockedAt: now,
+          lockedUntil: new Date(now.getTime() + LOCK_TIMEOUT_MS),
+          lockedBy: lockId,
+        },
+      },
+      { returnDocument: 'after' }
+    );
+
+    if (!lock || lock.lockedBy !== lockId) {
+      console.log('[Cleanup] Another instance is currently performing cleanup. Skipping concurrent run.');
+      return { skipped: true, reason: 'locked' };
+    }
+    lockAcquired = true;
+
     const jobs = await Job.find({
       deadline: { $exists: true, $ne: null },
       status: { $nin: ['expired', 'deleted'] },
@@ -79,22 +123,46 @@ async function deleteExpiredJobs() {
       }
     }
 
-    // Delete expired private jobs
+    let deletedPrivateCount = 0;
+    let markedGovCount = 0;
+
+    // Delete expired private jobs permanently
     if (privateExpiredIds.length > 0) {
-      await Job.deleteMany({ _id: { $in: privateExpiredIds } });
-      console.log(`Automatically removed ${privateExpiredIds.length} expired private jobs.`);
+      const delRes = await Job.deleteMany({ _id: { $in: privateExpiredIds } });
+      deletedPrivateCount = delRes.deletedCount ?? privateExpiredIds.length;
+      console.log(`[Cleanup] Automatically removed ${deletedPrivateCount} expired private jobs.`);
     }
 
     // Mark expired government jobs as 'expired' so they stay visible in Results
     if (govExpiredIds.length > 0) {
-      await Job.updateMany(
+      const updRes = await Job.updateMany(
         { _id: { $in: govExpiredIds } },
         { $set: { status: 'expired', expired: true } }
       );
-      console.log(`Marked ${govExpiredIds.length} government jobs as expired (visible in Results).`);
+      markedGovCount = updRes.modifiedCount ?? govExpiredIds.length;
+      console.log(`[Cleanup] Marked ${markedGovCount} government jobs as expired (visible in Results).`);
     }
+
+    return {
+      success: true,
+      deletedPrivateCount,
+      markedGovCount,
+    };
   } catch (err) {
-    console.error('Error deleting expired jobs:', err);
+    console.error('[Cleanup] Error deleting expired jobs:', err);
+    throw err;
+  } finally {
+    if (lockAcquired) {
+      try {
+        await Settings.findOneAndUpdate(
+          { key: lockKey, lockedBy: lockId },
+          { $set: { locked: false, lockedUntil: new Date(0) } },
+          { returnDocument: 'after' }
+        );
+      } catch (releaseErr) {
+        console.error('[Cleanup] Error releasing lock:', releaseErr);
+      }
+    }
   }
 }
 

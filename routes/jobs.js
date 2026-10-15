@@ -3,7 +3,7 @@ const router = express.Router();
 const Job = require('../models/Job');
 const Settings = require('../models/Settings');
 const { calculateDistance, getDrivingDistance, getDistance, isValidCoordinate, getLocationCoordinates } = require('../utils/geo');
-const { generateToken, generateUniqueJobId, validateBase64Image, isJobExpired, deleteExpiredJobs } = require('../utils/helpers');
+const { generateToken, generateUniqueJobId, validateBase64Image, isJobExpired } = require('../utils/helpers');
 const { sendJobNotification } = require('../utils/notifications');
 const { z } = require('zod');
 const validate = require('../middleware/validate');
@@ -29,6 +29,8 @@ const nearbySchema = z.object({
   lng: z.coerce.number({ required_error: 'lng is required' }),
   keyword: z.string().optional(),
   jobType: z.enum(['all', 'private', 'government']).optional().default('all'),
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
 });
 
 const everywhereSchema = z.object({
@@ -36,7 +38,57 @@ const everywhereSchema = z.object({
   location: z.string().optional(),
   keyword: z.string().optional(),
   jobType: z.enum(['all', 'private', 'government', 'results']).optional().default('all'),
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
 });
+
+// Positive field projection: selects only public display fields,
+// explicitly omitting sensitive internal fields like managementToken, upiTxnId, etc.
+const PUBLIC_JOB_PROJECTION = {
+  jobId: 1,
+  title: 1,
+  company: 1,
+  verified: 1,
+  logo: 1,
+  state: 1,
+  district: 1,
+  location: 1,
+  area: 1,
+  address: 1,
+  coordinates: 1,
+  lat: 1,
+  lng: 1,
+  type: 1,
+  experience: 1,
+  salary: 1,
+  posted: 1,
+  applicationMethod: 1,
+  whatsappNumber: 1,
+  contactEmail: 1,
+  status: 1,
+  publishedAt: 1,
+  expired: 1,
+  isResult: 1,
+  category: 1,
+  qualification: 1,
+  vacancies: 1,
+  description: 1,
+  benefits: 1,
+  deadline: 1,
+  jobType: 1,
+  officialApplyLink: 1,
+  officialWebsite: 1,
+  notificationPDF: 1,
+  department: 1,
+  ageLimit: 1,
+  startDate: 1,
+  selectionProcess: 1,
+  applicationFee: 1,
+  importantInstructions: 1,
+  importantDates: 1,
+  createdAt: 1,
+  updatedAt: 1,
+};
 
 const createJobSchema = z.discriminatedUnion('jobType', [
   z.object({
@@ -75,11 +127,10 @@ const createJobSchema = z.discriminatedUnion('jobType', [
 ]);
 
 // ── POST /api/jobs/nearby ──
-// Search jobs within 100km radius of given coordinates
+// Search jobs within 100km radius of given coordinates with pagination & projection
 router.post('/nearby', validate(nearbySchema), async (req, res) => {
   try {
-    await deleteExpiredJobs();
-    const { lat, lng, keyword, jobType } = req.body;
+    const { lat, lng, keyword, jobType, page, limit } = req.body;
 
     const userLat = Number(lat);
     const userLng = Number(lng);
@@ -87,6 +138,8 @@ router.post('/nearby', validate(nearbySchema), async (req, res) => {
     if (!isValidCoordinate(userLat, userLng)) {
       return res.status(400).json({ error: 'Valid user latitude and longitude are required' });
     }
+
+    const skip = (page - 1) * limit;
 
     // Build query filter with geospatial index querying
     const filter = {
@@ -122,11 +175,33 @@ router.post('/nearby', validate(nearbySchema), async (req, res) => {
       ];
     }
 
-    let jobs = [];
+    // Efficient count for geospatial query using $geoWithin
+    let total = 0;
     try {
-      jobs = await Job.find(filter).lean();
+      const countFilter = {
+        ...filter,
+        coordinates: {
+          $geoWithin: {
+            $centerSphere: [[userLng, userLat], 100 / 6378.1],
+          },
+        },
+      };
+      total = await Job.countDocuments(countFilter);
     } catch (e) {
-      console.warn('Geospatial $near query failed:', e.message);
+      console.warn('Geospatial count query failed:', e.message);
+    }
+
+    let jobs = [];
+    if (total > 0) {
+      try {
+        jobs = await Job.find(filter)
+          .select(PUBLIC_JOB_PROJECTION)
+          .skip(skip)
+          .limit(limit)
+          .lean();
+      } catch (e) {
+        console.warn('Geospatial $near query failed:', e.message);
+      }
     }
 
     // Fallback: If no jobs found within 100km (e.g. user location is outside Assam or > 100km away),
@@ -151,13 +226,20 @@ router.post('/nearby', validate(nearbySchema), async (req, res) => {
           { category: kwRegex },
         ];
       }
-      jobs = await Job.find(fallbackFilter).lean();
+
+      total = await Job.countDocuments(fallbackFilter);
+      jobs = await Job.find(fallbackFilter)
+        .select(PUBLIC_JOB_PROJECTION)
+        .skip(skip)
+        .limit(limit)
+        .lean();
     }
 
-    // Filter expired jobs
+    // Filter expired jobs in memory to guarantee no uncleaned expired jobs slip through
     jobs = jobs.filter((j) => !isJobExpired(j));
 
     // Map response with driving road distance, latitude, longitude, and id formatting
+    // Calculated only on the paginated slice to minimize latency
     const mappedJobs = await Promise.all(
       jobs.map(async (j) => {
         let jobLat = j.lat;
@@ -171,10 +253,6 @@ router.post('/nearby', validate(nearbySchema), async (req, res) => {
         }
 
         const dist = await getDrivingDistance(userLat, userLng, jobLat, jobLng);
-
-        console.log(
-          `[NEARBY DRIVING LOG] User: (${userLat}, ${userLng}) | Job (${j.title}): (${jobLat}, ${jobLng}) | Driving Distance: ${dist !== null ? `${dist} km` : 'Distance unavailable'}`
-        );
 
         return {
           ...j,
@@ -195,7 +273,18 @@ router.post('/nearby', validate(nearbySchema), async (req, res) => {
       return a.distance - b.distance;
     });
 
-    res.json({ jobs: mappedJobs });
+    const totalPages = Math.ceil(total / limit);
+
+    res.json({
+      jobs: mappedJobs,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages,
+        hasMore: page < totalPages,
+      },
+    });
   } catch (err) {
     console.error('Error in /api/jobs/nearby:', err);
     res.status(500).json({ error: err.message || 'Internal server error' });
@@ -203,11 +292,12 @@ router.post('/nearby', validate(nearbySchema), async (req, res) => {
 });
 
 // ── POST /api/jobs/everywhere ──
-// Get all jobs matching criteria
+// Get all jobs matching criteria with pagination and field projection
 router.post('/everywhere', validate(everywhereSchema), async (req, res) => {
   try {
-    await deleteExpiredJobs();
-    const { district, location, keyword, jobType } = req.body;
+    const { district, location, keyword, jobType, page, limit } = req.body;
+
+    const skip = (page - 1) * limit;
 
     // Build base filter
     const filter = {
@@ -243,7 +333,16 @@ router.post('/everywhere', validate(everywhereSchema), async (req, res) => {
       ];
     }
 
-    let jobs = await Job.find(filter).lean();
+    // Efficient total count directly from database
+    const total = await Job.countDocuments(filter);
+
+    // Fetch paginated jobs in MongoDB with field projection and sort
+    let jobs = await Job.find(filter)
+      .select(PUBLIC_JOB_PROJECTION)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean();
 
     // Apply expiry filtering based on jobType
     if (jobType === 'results') {
@@ -266,7 +365,18 @@ router.post('/everywhere', validate(everywhereSchema), async (req, res) => {
       };
     });
 
-    res.json({ jobs: mappedJobs });
+    const totalPages = Math.ceil(total / limit);
+
+    res.json({
+      jobs: mappedJobs,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages,
+        hasMore: page < totalPages,
+      },
+    });
   } catch (err) {
     console.error('Error in /api/jobs/everywhere:', err);
     res.status(500).json({ error: err.message || 'Internal server error' });

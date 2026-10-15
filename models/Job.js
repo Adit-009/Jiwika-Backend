@@ -71,6 +71,6 @@ jobSchema.index(
   { title: 'text', company: 'text', district: 'text', location: 'text', category: 'text' },
   { name: 'job_text_search' }
 );
-jobSchema.index({ status: 1, paused: 1, deletedAt: 1, jobType: 1 });
+jobSchema.index({ status: 1, paused: 1, deletedAt: 1, jobType: 1, createdAt: -1 });
 
 module.exports = mongoose.model('Job', jobSchema);

@@ -7,6 +7,11 @@ const settingsSchema = new mongoose.Schema(
     upiId: { type: String, default: 'jiwika@ybl' },
     amount: { type: Number, default: 99 },
     qrCodeImage: { type: String, default: '' },
+    // Lock fields for distributed background jobs / cron
+    locked: { type: Boolean, default: false },
+    lockedAt: { type: Date },
+    lockedUntil: { type: Date },
+    lockedBy: { type: String },
   },
   { timestamps: true }
 );
